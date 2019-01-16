@@ -1,0 +1,13 @@
+{
+    "name": "crazy-goat/bug-seeker-profiler",
+    "description": "Simple profiler for PHP7",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Piotr Hałas",
+            "email": "piotr@halas.net.pl"
+        }
+    ],
+    "require": {}
+}
