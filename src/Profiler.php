@@ -1,12 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace CrazyGoat\PoorRelic;
-
-$start = microtime(true);
-if (function_exists('tideways_xhprof_enable')) {
-    tideways_xhprof_enable();
-}
+namespace CrazyGoat\BugSeeker;
 
 final class Profiler
 {
@@ -22,6 +17,12 @@ final class Profiler
      * @var float
      */
     private $time;
+
+    /**
+     * @var int
+     */
+    private $traceTriggerTime;
+
     /**
      * @var array
      */
@@ -34,11 +35,22 @@ final class Profiler
 
     private $transactionID = null;
 
+    /**
+     * @var array
+     */
+    private $metrics = [];
+
+    /**
+     * @var ?\Closure
+     */
+    private $writer = null;
+
+    private $userMetrics = [];
+
     public static function getInstance()
     {
-        if (!isset(self::$instance)) {
-            $class = __CLASS__;
-            self::$instance = new $class();
+        if (!self::$instance instanceof Profiler) {
+            self::$instance = new Profiler();
         }
 
         return self::$instance;
@@ -50,10 +62,16 @@ final class Profiler
             throw new \RuntimeException('Instance of Profiler already exists - use Profiler::getInstance()');
         }
 
+        if (function_exists('tideways_xhprof_enable')) {
+            tideways_xhprof_enable();
+        }
+
         static::$instance = $this;
         $this->time = $start ?? microtime(true);
         $this->options = array_merge($this->getDefaultOptions(), $options);
         $this->transactionID = sha1(uniqid("", true));
+        $this->traceTriggerTime = (float)$this->options['trace_trigger_time'];
+        $this->writer = $this->options['writer'] ?? $this->getDefaultWriter();
         $this->registerShutdownFunction();
         $this->registerErrorHandler();
     }
@@ -63,7 +81,8 @@ final class Profiler
         return [
             'errors_backtrace' => true,
             'errors_backtrace_limit' => 0,
-            'data_dir' => sys_get_temp_dir()
+            'data_dir' => sys_get_temp_dir(),
+            'trace_trigger_time' => 5000 // 5 sec
         ];
     }
 
@@ -71,19 +90,45 @@ final class Profiler
     {
         register_shutdown_function(
             function (): void {
-                file_put_contents(
-                    sprintf('%s/profiler-%s-%s.json', $this->options['data_dir'], $this->app, uniqid("", true)),
-                    json_encode($this->getData())
-                );
+
+                $data = $this->getData();
+                $trace['trace'] = $data['profiler'] ?? [];
+                unset($data['profiler']);
+
+                $data['trace_id'] = null;
+                if (!empty($trace['trace'])) {
+                    $traceId = sha1(uniqid("",true));
+                    $data['trace_id'] = $traceId;
+                    $trace['_data_type'] = 'trace';
+                    $trace['host'] = gethostname();
+                    $trace['transaction_id'] = $this->transactionID;
+                    $trace['trace_id'] = $traceId;
+                    ($this->writer)($trace);
+                }
+
+                ($this->writer)($data);
 
                 foreach ($this->errors as $error) {
-                    file_put_contents(
-                        sprintf('%s/error-%s-%s.json', $this->options['data_dir'], $this->app, uniqid("", true)),
-                        json_encode($error)
-                    );
+                    ($this->writer)($error);
                 }
             }
         );
+    }
+
+    private function getDefaultWriter(): \Closure
+    {
+        return function (array $data): void {
+            file_put_contents(
+                sprintf(
+                    '%s/%s-%s-%s.json',
+                    $this->options['data_dir'],
+                    $data['_data_type'],
+                    $this->app,
+                    uniqid("", true)
+                ),
+                json_encode($data, JSON_PRETTY_PRINT)
+            );
+        };
     }
 
     private function addError(array $data): void
@@ -93,7 +138,8 @@ final class Profiler
         if (!isset($this->errors[$key])) {
             $this->errors[$key] = $data;
             $this->errors[$key]['count'] = 1;
-            $this->errors[$key]['backtrace'] = array_values(array_map(
+            $this->errors[$key]['backtrace'] = array_values(
+                array_map(
                     function (array $trace): string {
                         return sprintf('%s:%s', $trace['file'], $trace['line']);
                     },
@@ -110,9 +156,29 @@ final class Profiler
         }
     }
 
+    public function addUserMetric(string $key, float $time, string $prefix = 'default'): void
+    {
+        if (!isset($this->userMetrics[$prefix]['time'])) {
+            $this->userMetrics[$prefix]['time'] = 0;
+        }
+
+        $this->userMetrics[$prefix]['time'] += $time;
+
+        if (!isset($this->userMetrics[$prefix]['items'][$key])) {
+            $this->userMetrics[$prefix]['items'][$key] = [
+                'cnt' => 1,
+                'time' => $time
+            ];
+        } else {
+            $this->userMetrics[$prefix]['items'][$key]['cnt'] += 1;
+            $this->userMetrics[$prefix]['items'][$key]['time'] += $time;
+        }
+
+    }
+
     private function getTime(): float
     {
-        return round((microtime(true) - $this->time) * 1000);
+        return microtime(true) - $this->time;
     }
 
     private function getRequestData()
@@ -129,14 +195,41 @@ final class Profiler
     {
         $executionTime = $this->getTime();
 
+        $profilerData = [];
+
+        if ($executionTime >= $this->traceTriggerTime || !empty($this->metrics)) {
+            $profilerData = $this->getProfilerData();
+        }
+
+        $metricsData = array_filter(
+            $profilerData,
+            function (string $key) {
+                return in_array(explode('==>', $key, 2)[1] ?? '', $this->metrics);
+            },
+            ARRAY_FILTER_USE_KEY
+        );
+
+        $metricsData = array_map(
+            function (array $trace):array {
+                $trace['wt'] = $trace['wt']/1000000;
+                return $trace;
+            },
+            $metricsData
+        );
+
         return [
+            '_data_type' => 'profiler',
+            'host' => gethostname(),
             'transaction_id' => $this->transactionID,
             'application' => $this->app,
             'transaction_name' => $this->name,
             'time' => $this->time,
             'execution_time' => $executionTime,
-            'profiler' => $executionTime > 1000 ? $this->getProfilerData() : [],
-            'request' => $this->getRequestData()
+            'profiler' => $executionTime >= $this->traceTriggerTime ? $profilerData : null,
+            'metrics' => $metricsData,
+            'user_metrics' => $this->userMetrics,
+            'request' => $this->getRequestData(),
+            'error_count' => count($this->errors)
         ];
     }
 
@@ -154,6 +247,8 @@ final class Profiler
     {
         return function (int $errno, string $errstr, string $errfile, int $errline): bool {
             $this->addError([
+                '_data_type' => 'error',
+                'host' => gethostname(),
                 'transaction_id' => $this->transactionID,
                 'number' => $errno,
                 'string' => $errstr,
@@ -196,6 +291,32 @@ final class Profiler
         $this->time = $time;
         return $this;
     }
-}
 
-Profiler::getInstance()->setTime($start);
+    /**
+     * @param array $metrics
+     * @return Profiler
+     */
+    public function setMetrics(array $metrics): Profiler
+    {
+        $this->metrics = $metrics;
+        return $this;
+    }
+
+    public function addMetric(string $functionName): Profiler
+    {
+        $this->metrics[] = $functionName;
+        $this->metrics = array_unique($this->metrics);
+
+        return $this;
+    }
+
+    /**
+     * @param string $app
+     * @return Profiler
+     */
+    public function setAppName(string $app): Profiler
+    {
+        $this->app = $app;
+        return $this;
+    }
+}
